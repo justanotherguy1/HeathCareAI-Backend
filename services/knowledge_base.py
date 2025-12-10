@@ -1,7 +1,7 @@
 """
 Knowledge Base Service
 Manages medical knowledge for breast cancer patient queries
-Uses OpenSearch for vector similarity search
+Uses OpenSearch for hybrid search (vector + keyword)
 """
 
 import json
@@ -17,6 +17,10 @@ from models.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Hybrid search weights (tune these for best results)
+VECTOR_WEIGHT = 0.7  # Weight for semantic/vector similarity
+KEYWORD_WEIGHT = 0.3  # Weight for keyword matching
 
 
 # ================================
@@ -117,12 +121,12 @@ def get_index_mapping(use_vectors: bool = True) -> Dict[str, Any]:
     }
 
 
-def create_index_if_not_exists(index_name: str = None, use_vectors: bool = False) -> bool:
+def create_index_if_not_exists(index_name: str = None, use_vectors: bool = True) -> bool:
     """Create OpenSearch index if it doesn't exist
     
     Args:
         index_name: Name of the index to create
-        use_vectors: Whether to include vector/KNN fields (not supported on SEARCH collections)
+        use_vectors: Whether to include vector/KNN fields (requires VECTOR SEARCH collection)
     """
     index_name = index_name or settings.opensearch_index
     
@@ -148,12 +152,12 @@ def create_index_if_not_exists(index_name: str = None, use_vectors: bool = False
 # ================================
 
 class KnowledgeBaseService:
-    """Service for managing and searching the knowledge base"""
+    """Service for managing and searching the knowledge base with hybrid search"""
     
-    def __init__(self, index_name: str = None, use_vectors: bool = False):
+    def __init__(self, index_name: str = None, use_vectors: bool = True):
         self.index_name = index_name or settings.opensearch_index
         self.use_vectors = use_vectors
-        self.embedding_service = EmbeddingService() if use_vectors else None
+        self.embedding_service = EmbeddingService()  # Always initialize for hybrid search
         self._client = None
     
     def _get_client(self):
@@ -163,7 +167,7 @@ class KnowledgeBaseService:
         return self._client
     
     async def add_document(self, document: KnowledgeDocument) -> str:
-        """Add a document to the knowledge base"""
+        """Add a document to the knowledge base with vector embedding"""
         try:
             # Prepare document for indexing
             doc_id = document.id or str(hash(document.title + document.content))
@@ -181,15 +185,15 @@ class KnowledgeBaseService:
                 "updated_at": datetime.utcnow().isoformat()
             }
             
-            # Create embedding if vectors are enabled
-            if self.use_vectors and self.embedding_service:
-                text_for_embedding = f"{document.title}. {document.content}"
-                embedding = self.embedding_service.create_embedding(text_for_embedding)
-                
-                if embedding:
-                    doc_body["embedding"] = embedding
-                else:
-                    logger.warning(f"Failed to create embedding for document {doc_id}, indexing without it")
+            # Always create embedding for hybrid search
+            text_for_embedding = f"{document.title}. {document.content}"
+            embedding = self.embedding_service.create_embedding(text_for_embedding)
+            
+            if embedding:
+                doc_body["embedding"] = embedding
+                logger.debug(f"Created embedding for document {doc_id}")
+            else:
+                raise ValueError(f"Failed to create embedding for document {doc_id}")
             
             # Index document
             # Note: OpenSearch Serverless doesn't support custom IDs or refresh parameter
@@ -216,7 +220,10 @@ class KnowledgeBaseService:
         limit: int = 10
     ) -> KnowledgeSearchResponse:
         """
-        Search the knowledge base using vector search (if enabled) or keyword search
+        Search the knowledge base using HYBRID search (vector + keyword).
+        
+        Combines semantic similarity (understanding meaning) with keyword matching
+        (exact terms) for best results.
         """
         start_time = time.time()
         
@@ -228,93 +235,84 @@ class KnowledgeBaseService:
             if content_type:
                 filters.append({"term": {"content_type": content_type.value}})
             
-            # Build search query based on whether vectors are enabled
-            if self.use_vectors and self.embedding_service:
-                # Vector search
-                query_embedding = self.embedding_service.create_embedding(query)
-                
-                if not query_embedding:
-                    raise ValueError("Failed to create query embedding")
-                
-                search_query = {
-                    "size": limit,
-                    "query": {
-                        "knn": {
-                            "embedding": {
-                                "vector": query_embedding,
-                                "k": limit
-                            }
-                        }
-                    }
-                }
-                
-                # Add filters if present
-                if filters:
-                    search_query["query"] = {
-                        "bool": {
-                            "must": [
-                                {
-                                    "knn": {
-                                        "embedding": {
-                                            "vector": query_embedding,
-                                            "k": limit
-                                        }
+            # Create query embedding for vector search
+            query_embedding = self.embedding_service.create_embedding(query)
+            
+            if not query_embedding:
+                raise ValueError("Failed to create query embedding")
+            
+            # Build hybrid search query combining vector + keyword
+            # Using script_score to combine KNN with keyword matching
+            hybrid_query = {
+                "size": limit * 2,  # Get more results to re-rank
+                "query": {
+                    "bool": {
+                        "should": [
+                            # Vector search component (semantic similarity)
+                            {
+                                "knn": {
+                                    "embedding": {
+                                        "vector": query_embedding,
+                                        "k": limit * 2
                                     }
                                 }
-                            ],
-                            "filter": filters
-                        }
-                    }
-            else:
-                # Keyword search (fallback for SEARCH collections)
-                must_clauses = [
-                    {
-                        "multi_match": {
-                            "query": query,
-                            "fields": ["title^2", "content"],
-                            "type": "best_fields"
-                        }
-                    }
-                ]
-                
-                search_query = {
-                    "size": limit,
-                    "query": {
-                        "bool": {
-                            "must": must_clauses,
-                            "filter": filters
-                        }
-                    } if filters else {
-                        "bool": {
-                            "must": must_clauses
-                        }
+                            },
+                            # Keyword search component (exact matching)
+                            {
+                                "multi_match": {
+                                    "query": query,
+                                    "fields": ["title^3", "content"],
+                                    "type": "best_fields",
+                                    "boost": KEYWORD_WEIGHT / VECTOR_WEIGHT  # Relative weight
+                                }
+                            }
+                        ],
+                        "minimum_should_match": 1
                     }
                 }
+            }
             
-            # Execute search
+            # Add filters if present
+            if filters:
+                hybrid_query["query"]["bool"]["filter"] = filters
+            
+            # Execute hybrid search
             client = self._get_client()
             response = client.search(
                 index=self.index_name,
-                body=search_query
+                body=hybrid_query
             )
             
-            # Parse results
-            results = []
+            # Parse and deduplicate results
             hits = response.get("hits", {}).get("hits", [])
+            seen_docs = set()
+            results = []
             
             for hit in hits:
                 source = hit["_source"]
+                doc_id = source.get("document_id", hit["_id"])
+                
+                # Skip duplicates (can happen with hybrid search)
+                if doc_id in seen_docs:
+                    continue
+                seen_docs.add(doc_id)
+                
                 results.append(KnowledgeSearchResult(
-                    document_id=source.get("document_id", hit["_id"]),
+                    document_id=doc_id,
                     title=source.get("title", ""),
-                    content_excerpt=source.get("content", "")[:300],
+                    content_excerpt=source.get("content", "")[:500],  # Longer excerpts
                     relevance_score=hit.get("_score", 0.0),
-                    content_type=ContentType(source.get("content_type", "medical_article")),
+                    content_type=ContentType(source.get("content_type", "faq")),
                     category=QueryCategory(source.get("category", "general")),
                     source_url=source.get("source_url")
                 ))
+                
+                if len(results) >= limit:
+                    break
             
             elapsed_ms = (time.time() - start_time) * 1000
+            
+            logger.info(f"Hybrid search completed: {len(results)} results in {elapsed_ms:.1f}ms")
             
             return KnowledgeSearchResponse(
                 results=results,
@@ -323,7 +321,7 @@ class KnowledgeBaseService:
             )
             
         except Exception as e:
-            logger.error(f"Error searching knowledge base: {e}")
+            logger.error(f"Error in hybrid search: {e}")
             raise
     
     async def get_relevant_context(
@@ -406,15 +404,16 @@ class KnowledgeBaseService:
 _knowledge_base: Optional[KnowledgeBaseService] = None
 
 
-def get_knowledge_base(use_vectors: bool = False) -> KnowledgeBaseService:
-    """Get knowledge base service singleton
+def get_knowledge_base(use_vectors: bool = True) -> KnowledgeBaseService:
+    """Get knowledge base service singleton with hybrid search enabled
     
     Args:
-        use_vectors: Whether to use vector search (requires VECTOR SEARCH collection type)
-                    Set to False for SEARCH collections (keyword search only)
+        use_vectors: Whether to use vector/hybrid search (default: True)
+                    Requires VECTOR SEARCH collection type in OpenSearch Serverless
     """
     global _knowledge_base
     if _knowledge_base is None:
         _knowledge_base = KnowledgeBaseService(use_vectors=use_vectors)
+        logger.info(f"Initialized KnowledgeBaseService (vectors={use_vectors})")
     return _knowledge_base
 

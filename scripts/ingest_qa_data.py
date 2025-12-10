@@ -1,12 +1,13 @@
 """
 Script to ingest Q&A data into the Knowledge Base
-Parses the SampleQ&A file and uploads to OpenSearch
+Parses the SampleQ&A file and uploads to OpenSearch with vector embeddings
 """
 
 import sys
 import re
 import asyncio
 import logging
+import time
 from pathlib import Path
 
 # Add parent directory to path for imports
@@ -15,11 +16,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from services.knowledge_base import get_knowledge_base, create_index_if_not_exists
+from services.knowledge_base import get_knowledge_base, create_index_if_not_exists, KnowledgeBaseService
 from models.schemas import KnowledgeDocument, QueryCategory, ContentType
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Enable vector embeddings for hybrid search
+USE_VECTORS = True
 
 
 def parse_qa_file(file_path: str) -> list[dict]:
@@ -101,23 +105,25 @@ def categorize_question(question: str) -> QueryCategory:
 
 
 async def ingest_documents(documents: list[dict], dry_run: bool = False):
-    """Ingest documents into the knowledge base"""
+    """Ingest documents into the knowledge base with vector embeddings"""
     
     if not dry_run:
-        # Create index if it doesn't exist (without vectors for SEARCH collections)
-        logger.info("Checking/creating OpenSearch index...")
-        if not create_index_if_not_exists(use_vectors=False):
+        # Create index with vector support for hybrid search
+        logger.info("Checking/creating OpenSearch index with vector support...")
+        if not create_index_if_not_exists(use_vectors=USE_VECTORS):
             logger.error("Failed to create index. Check OpenSearch configuration.")
             return
     
-    # Use knowledge base without vectors (keyword search only)
-    from services.knowledge_base import KnowledgeBaseService
-    kb = KnowledgeBaseService(use_vectors=False)
+    # Initialize knowledge base with vector support for hybrid search
+    kb = KnowledgeBaseService(use_vectors=USE_VECTORS)
     
     success_count = 0
     error_count = 0
+    start_time = time.time()
     
-    for doc in documents:
+    logger.info(f"Starting ingestion of {len(documents)} documents with embeddings...")
+    
+    for i, doc in enumerate(documents):
         try:
             # Create knowledge document
             category = categorize_question(doc['question'])
@@ -136,7 +142,7 @@ async def ingest_documents(documents: list[dict], dry_run: bool = False):
                 logger.info(f"[DRY RUN] Would add: Q{doc['number']}: {doc['question'][:50]}... | Category: {category.value}")
             else:
                 doc_id = await kb.add_document(knowledge_doc)
-                logger.info(f"Added Q{doc['number']}: {doc['question'][:50]}... -> {doc_id}")
+                logger.info(f"[{i+1}/{len(documents)}] Added Q{doc['number']}: {doc['question'][:40]}... -> {doc_id}")
             
             success_count += 1
             
@@ -144,11 +150,15 @@ async def ingest_documents(documents: list[dict], dry_run: bool = False):
             logger.error(f"Error adding Q{doc['number']}: {e}")
             error_count += 1
     
+    elapsed = time.time() - start_time
+    
     logger.info(f"\n{'='*50}")
     logger.info(f"Ingestion complete!")
     logger.info(f"  Successful: {success_count}")
     logger.info(f"  Errors: {error_count}")
     logger.info(f"  Total: {len(documents)}")
+    logger.info(f"  Time: {elapsed:.1f}s ({elapsed/len(documents):.2f}s per doc)")
+    logger.info(f"  Vectors: {'Enabled' if USE_VECTORS else 'Disabled'}")
 
 
 async def main():

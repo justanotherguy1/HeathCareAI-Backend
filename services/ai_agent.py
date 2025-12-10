@@ -198,6 +198,14 @@ Content: {source.get('content', '')[:500]}...
         
         return "\n".join(context_parts)
     
+    def _is_nova_model(self) -> bool:
+        """Check if using Amazon Nova model"""
+        return 'nova' in self.model_id.lower()
+    
+    def _is_claude_model(self) -> bool:
+        """Check if using Anthropic Claude model"""
+        return 'anthropic' in self.model_id.lower() or 'claude' in self.model_id.lower()
+    
     async def generate_response(
         self,
         question: str,
@@ -207,6 +215,7 @@ Content: {source.get('content', '')[:500]}...
     ) -> Tuple[str, float]:
         """
         Generate AI response to patient question
+        Supports both Amazon Nova and Anthropic Claude models
         
         Returns:
             Tuple of (response_text, confidence_score)
@@ -226,18 +235,34 @@ Content: {source.get('content', '')[:500]}...
         try:
             client = self._get_client()
             
-            # Call Bedrock
-            body = json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1500,
-                "temperature": 0.3,  # Lower temperature for more consistent medical info
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ]
-            })
+            # Build request body based on model type
+            if self._is_nova_model():
+                # Amazon Nova format
+                body = json.dumps({
+                    "inferenceConfig": {
+                        "max_new_tokens": 1500,
+                        "temperature": 0.3
+                    },
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"text": prompt}]
+                        }
+                    ]
+                })
+            else:
+                # Anthropic Claude format (default)
+                body = json.dumps({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 1500,
+                    "temperature": 0.3,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                })
             
             response = client.invoke_model(
                 modelId=self.model_id,
@@ -245,7 +270,12 @@ Content: {source.get('content', '')[:500]}...
             )
             
             response_body = json.loads(response['body'].read())
-            answer = response_body['content'][0]['text']
+            
+            # Parse response based on model type
+            if self._is_nova_model():
+                answer = response_body['output']['message']['content'][0]['text']
+            else:
+                answer = response_body['content'][0]['text']
             
             # Calculate confidence based on response characteristics
             confidence = self._calculate_confidence(answer, knowledge_sources)
@@ -316,17 +346,17 @@ async def chat_with_agent(
     # Get conversation history
     history = SessionManager.get_history(session_id)
     
-    # Search knowledge base for relevant sources
+    # Search knowledge base for relevant sources using hybrid search
     from services.knowledge_base import get_knowledge_base
     try:
-        kb = get_knowledge_base(use_vectors=False)
+        kb = get_knowledge_base(use_vectors=True)  # Enable hybrid search (vector + keyword)
         knowledge_context = await kb.get_relevant_context(
             query=message,
             category=query_category,
             limit=5
         )
         knowledge_sources = knowledge_context
-        logger.info(f"Retrieved {len(knowledge_sources)} knowledge sources")
+        logger.info(f"Retrieved {len(knowledge_sources)} knowledge sources via hybrid search")
     except Exception as e:
         logger.warning(f"Failed to retrieve knowledge sources: {e}")
         knowledge_sources = []

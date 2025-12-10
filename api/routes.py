@@ -74,10 +74,10 @@ async def search_knowledge_base(request: KnowledgeSearchRequest):
     """
     Search the medical knowledge base.
     
-    Uses semantic search to find relevant information about breast cancer.
+    Uses keyword search to find relevant information about breast cancer.
     """
     try:
-        kb = get_knowledge_base()
+        kb = get_knowledge_base(use_vectors=False)  # Keyword search for SEARCH collections
         response = await kb.search(
             query=request.query,
             category=request.category,
@@ -99,10 +99,10 @@ async def add_document(document: KnowledgeDocument):
     """
     Add a document to the knowledge base.
     
-    Documents are processed, chunked, and indexed for semantic search.
+    Documents are indexed for keyword search.
     """
     try:
-        kb = get_knowledge_base()
+        kb = get_knowledge_base(use_vectors=False)
         doc_id = await kb.add_document(document)
         
         return DocumentUploadResponse(
@@ -125,7 +125,7 @@ async def add_document(document: KnowledgeDocument):
 async def delete_document(document_id: str):
     """Delete a document from the knowledge base"""
     try:
-        kb = get_knowledge_base()
+        kb = get_knowledge_base(use_vectors=False)
         success = await kb.delete_document(document_id)
         
         if success:
@@ -144,7 +144,7 @@ async def delete_document(document_id: str):
 async def get_knowledge_stats():
     """Get knowledge base statistics"""
     try:
-        kb = get_knowledge_base()
+        kb = get_knowledge_base(use_vectors=False)
         stats = await kb.get_stats()
         return stats
     except Exception as e:

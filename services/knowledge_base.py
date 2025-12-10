@@ -66,58 +66,73 @@ class EmbeddingService:
 # OpenSearch Index Management
 # ================================
 
-def get_index_mapping() -> Dict[str, Any]:
+def get_index_mapping(use_vectors: bool = True) -> Dict[str, Any]:
     """Get OpenSearch index mapping for knowledge base"""
-    return {
-        "settings": {
-            "index": {
-                "knn": True,
-                "number_of_shards": 2,
-                "number_of_replicas": 1
-            }
-        },
-        "mappings": {
-            "properties": {
-                "document_id": {"type": "keyword"},
-                "title": {"type": "text", "analyzer": "standard"},
-                "content": {"type": "text", "analyzer": "standard"},
-                "content_type": {"type": "keyword"},
-                "category": {"type": "keyword"},
-                "source_url": {"type": "keyword"},
-                "author": {"type": "text"},
-                "published_date": {"type": "date"},
-                "tags": {"type": "keyword"},
-                "created_at": {"type": "date"},
-                "updated_at": {"type": "date"},
-                "embedding": {
-                    "type": "knn_vector",
-                    "dimension": settings.kb_embedding_dimension,
-                    "method": {
-                        "name": "hnsw",
-                        "space_type": "cosinesimil",
-                        "engine": "faiss",
-                        "parameters": {
-                            "ef_construction": 512,
-                            "m": 16
-                        }
-                    }
+    mappings = {
+        "properties": {
+            "document_id": {"type": "keyword"},
+            "title": {"type": "text", "analyzer": "standard"},
+            "content": {"type": "text", "analyzer": "standard"},
+            "content_type": {"type": "keyword"},
+            "category": {"type": "keyword"},
+            "source_url": {"type": "keyword"},
+            "author": {"type": "text"},
+            "published_date": {"type": "date"},
+            "tags": {"type": "keyword"},
+            "created_at": {"type": "date"},
+            "updated_at": {"type": "date"}
+        }
+    }
+    
+    # Add vector field only if using vector search
+    if use_vectors:
+        mappings["properties"]["embedding"] = {
+            "type": "knn_vector",
+            "dimension": settings.kb_embedding_dimension,
+            "method": {
+                "name": "hnsw",
+                "space_type": "cosinesimil",
+                "engine": "faiss",
+                "parameters": {
+                    "ef_construction": 512,
+                    "m": 16
                 }
             }
         }
+    
+    settings_dict = {
+        "index": {
+            "number_of_shards": 2,
+            "number_of_replicas": 1
+        }
+    }
+    
+    # Add KNN setting only if using vectors
+    if use_vectors:
+        settings_dict["index"]["knn"] = True
+    
+    return {
+        "settings": settings_dict,
+        "mappings": mappings
     }
 
 
-def create_index_if_not_exists(index_name: str = None) -> bool:
-    """Create OpenSearch index if it doesn't exist"""
+def create_index_if_not_exists(index_name: str = None, use_vectors: bool = False) -> bool:
+    """Create OpenSearch index if it doesn't exist
+    
+    Args:
+        index_name: Name of the index to create
+        use_vectors: Whether to include vector/KNN fields (not supported on SEARCH collections)
+    """
     index_name = index_name or settings.opensearch_index
     
     try:
         client = opensearch()
         
         if not client.indices.exists(index=index_name):
-            mapping = get_index_mapping()
+            mapping = get_index_mapping(use_vectors=use_vectors)
             client.indices.create(index=index_name, body=mapping)
-            logger.info(f"Created index: {index_name}")
+            logger.info(f"Created index: {index_name} (vectors={'enabled' if use_vectors else 'disabled'})")
             return True
         else:
             logger.info(f"Index already exists: {index_name}")
@@ -135,9 +150,10 @@ def create_index_if_not_exists(index_name: str = None) -> bool:
 class KnowledgeBaseService:
     """Service for managing and searching the knowledge base"""
     
-    def __init__(self, index_name: str = None):
+    def __init__(self, index_name: str = None, use_vectors: bool = False):
         self.index_name = index_name or settings.opensearch_index
-        self.embedding_service = EmbeddingService()
+        self.use_vectors = use_vectors
+        self.embedding_service = EmbeddingService() if use_vectors else None
         self._client = None
     
     def _get_client(self):
@@ -149,13 +165,6 @@ class KnowledgeBaseService:
     async def add_document(self, document: KnowledgeDocument) -> str:
         """Add a document to the knowledge base"""
         try:
-            # Create embedding for the document content
-            text_for_embedding = f"{document.title}. {document.content}"
-            embedding = self.embedding_service.create_embedding(text_for_embedding)
-            
-            if not embedding:
-                raise ValueError("Failed to create embedding for document")
-            
             # Prepare document for indexing
             doc_id = document.id or str(hash(document.title + document.content))
             doc_body = {
@@ -169,21 +178,31 @@ class KnowledgeBaseService:
                 "published_date": document.published_date.isoformat() if document.published_date else None,
                 "tags": document.tags,
                 "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
-                "embedding": embedding
+                "updated_at": datetime.utcnow().isoformat()
             }
             
+            # Create embedding if vectors are enabled
+            if self.use_vectors and self.embedding_service:
+                text_for_embedding = f"{document.title}. {document.content}"
+                embedding = self.embedding_service.create_embedding(text_for_embedding)
+                
+                if embedding:
+                    doc_body["embedding"] = embedding
+                else:
+                    logger.warning(f"Failed to create embedding for document {doc_id}, indexing without it")
+            
             # Index document
+            # Note: OpenSearch Serverless doesn't support custom IDs or refresh parameter
             client = self._get_client()
             response = client.index(
                 index=self.index_name,
-                id=doc_id,
-                body=doc_body,
-                refresh=True
+                body=doc_body
             )
             
-            logger.info(f"Indexed document: {doc_id}")
-            return doc_id
+            # Get the auto-generated ID from response
+            generated_id = response.get('_id', doc_id)
+            logger.info(f"Indexed document: {doc_body['document_id']} (ID: {generated_id})")
+            return generated_id
             
         except Exception as e:
             logger.error(f"Error adding document: {e}")
@@ -197,17 +216,11 @@ class KnowledgeBaseService:
         limit: int = 10
     ) -> KnowledgeSearchResponse:
         """
-        Search the knowledge base using hybrid search (vector + keyword)
+        Search the knowledge base using vector search (if enabled) or keyword search
         """
         start_time = time.time()
         
         try:
-            # Create query embedding
-            query_embedding = self.embedding_service.create_embedding(query)
-            
-            if not query_embedding:
-                raise ValueError("Failed to create query embedding")
-            
             # Build filters
             filters = []
             if category:
@@ -215,34 +228,66 @@ class KnowledgeBaseService:
             if content_type:
                 filters.append({"term": {"content_type": content_type.value}})
             
-            # Vector search query
-            vector_query = {
-                "size": limit,
-                "query": {
-                    "knn": {
-                        "embedding": {
-                            "vector": query_embedding,
-                            "k": limit
+            # Build search query based on whether vectors are enabled
+            if self.use_vectors and self.embedding_service:
+                # Vector search
+                query_embedding = self.embedding_service.create_embedding(query)
+                
+                if not query_embedding:
+                    raise ValueError("Failed to create query embedding")
+                
+                search_query = {
+                    "size": limit,
+                    "query": {
+                        "knn": {
+                            "embedding": {
+                                "vector": query_embedding,
+                                "k": limit
+                            }
                         }
                     }
                 }
-            }
-            
-            # Add filters if present
-            if filters:
-                vector_query["query"] = {
-                    "bool": {
-                        "must": [
-                            {
-                                "knn": {
-                                    "embedding": {
-                                        "vector": query_embedding,
-                                        "k": limit
+                
+                # Add filters if present
+                if filters:
+                    search_query["query"] = {
+                        "bool": {
+                            "must": [
+                                {
+                                    "knn": {
+                                        "embedding": {
+                                            "vector": query_embedding,
+                                            "k": limit
+                                        }
                                     }
                                 }
-                            }
-                        ],
-                        "filter": filters
+                            ],
+                            "filter": filters
+                        }
+                    }
+            else:
+                # Keyword search (fallback for SEARCH collections)
+                must_clauses = [
+                    {
+                        "multi_match": {
+                            "query": query,
+                            "fields": ["title^2", "content"],
+                            "type": "best_fields"
+                        }
+                    }
+                ]
+                
+                search_query = {
+                    "size": limit,
+                    "query": {
+                        "bool": {
+                            "must": must_clauses,
+                            "filter": filters
+                        }
+                    } if filters else {
+                        "bool": {
+                            "must": must_clauses
+                        }
                     }
                 }
             
@@ -250,7 +295,7 @@ class KnowledgeBaseService:
             client = self._get_client()
             response = client.search(
                 index=self.index_name,
-                body=vector_query
+                body=search_query
             )
             
             # Parse results
@@ -361,10 +406,15 @@ class KnowledgeBaseService:
 _knowledge_base: Optional[KnowledgeBaseService] = None
 
 
-def get_knowledge_base() -> KnowledgeBaseService:
-    """Get knowledge base service singleton"""
+def get_knowledge_base(use_vectors: bool = False) -> KnowledgeBaseService:
+    """Get knowledge base service singleton
+    
+    Args:
+        use_vectors: Whether to use vector search (requires VECTOR SEARCH collection type)
+                    Set to False for SEARCH collections (keyword search only)
+    """
     global _knowledge_base
     if _knowledge_base is None:
-        _knowledge_base = KnowledgeBaseService()
+        _knowledge_base = KnowledgeBaseService(use_vectors=use_vectors)
     return _knowledge_base
 

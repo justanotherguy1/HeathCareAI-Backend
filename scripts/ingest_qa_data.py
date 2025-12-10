@@ -104,13 +104,15 @@ async def ingest_documents(documents: list[dict], dry_run: bool = False):
     """Ingest documents into the knowledge base"""
     
     if not dry_run:
-        # Create index if it doesn't exist
+        # Create index if it doesn't exist (without vectors for SEARCH collections)
         logger.info("Checking/creating OpenSearch index...")
-        if not create_index_if_not_exists():
+        if not create_index_if_not_exists(use_vectors=False):
             logger.error("Failed to create index. Check OpenSearch configuration.")
             return
     
-    kb = get_knowledge_base()
+    # Use knowledge base without vectors (keyword search only)
+    from services.knowledge_base import KnowledgeBaseService
+    kb = KnowledgeBaseService(use_vectors=False)
     
     success_count = 0
     error_count = 0

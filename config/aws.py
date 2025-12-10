@@ -24,6 +24,13 @@ def get_opensearch_client():
     if not settings.opensearch_endpoint:
         raise ValueError("OpenSearch endpoint not configured")
     
+    # Strip protocol from endpoint if present
+    endpoint = settings.opensearch_endpoint
+    endpoint = endpoint.replace('https://', '').replace('http://', '')
+    
+    # Detect if this is OpenSearch Serverless (aoss) or regular OpenSearch
+    service = 'aoss' if 'aoss.amazonaws.com' in endpoint else 'es'
+    
     # Get AWS credentials for signing requests
     credentials = boto3.Session(
         aws_access_key_id=settings.aws_access_key_id,
@@ -35,12 +42,12 @@ def get_opensearch_client():
         credentials.access_key,
         credentials.secret_key,
         settings.aws_region,
-        'es',  # 'es' for OpenSearch/Elasticsearch
+        service,  # 'aoss' for Serverless, 'es' for regular OpenSearch
         session_token=credentials.token
     )
     
     return OpenSearch(
-        hosts=[{'host': settings.opensearch_endpoint, 'port': 443}],
+        hosts=[{'host': endpoint, 'port': 443}],
         http_auth=awsauth,
         use_ssl=True,
         verify_certs=True,

@@ -316,9 +316,20 @@ async def chat_with_agent(
     # Get conversation history
     history = SessionManager.get_history(session_id)
     
-    # TODO: Search knowledge base for relevant sources
-    # This will be implemented in knowledge_base.py
-    knowledge_sources = []
+    # Search knowledge base for relevant sources
+    from services.knowledge_base import get_knowledge_base
+    try:
+        kb = get_knowledge_base(use_vectors=False)
+        knowledge_context = await kb.get_relevant_context(
+            query=message,
+            category=query_category,
+            limit=5
+        )
+        knowledge_sources = knowledge_context
+        logger.info(f"Retrieved {len(knowledge_sources)} knowledge sources")
+    except Exception as e:
+        logger.warning(f"Failed to retrieve knowledge sources: {e}")
+        knowledge_sources = []
     
     # Generate AI response
     agent = BreastCancerCompanionAgent()

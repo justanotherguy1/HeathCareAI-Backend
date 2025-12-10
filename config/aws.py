@@ -1,0 +1,90 @@
+"""
+AWS Client Configuration
+Initializes Bedrock, OpenSearch, and S3 clients
+"""
+
+import boto3
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
+from .settings import settings
+
+
+def get_bedrock_client():
+    """Get Bedrock Runtime client for AI model invocation"""
+    return boto3.client(
+        service_name='bedrock-runtime',
+        region_name=settings.aws_region,
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key
+    )
+
+
+def get_opensearch_client():
+    """Get OpenSearch client for knowledge base queries"""
+    if not settings.opensearch_endpoint:
+        raise ValueError("OpenSearch endpoint not configured")
+    
+    # Get AWS credentials for signing requests
+    credentials = boto3.Session(
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        region_name=settings.aws_region
+    ).get_credentials()
+    
+    awsauth = AWS4Auth(
+        credentials.access_key,
+        credentials.secret_key,
+        settings.aws_region,
+        'es',  # 'es' for OpenSearch/Elasticsearch
+        session_token=credentials.token
+    )
+    
+    return OpenSearch(
+        hosts=[{'host': settings.opensearch_endpoint, 'port': 443}],
+        http_auth=awsauth,
+        use_ssl=True,
+        verify_certs=True,
+        connection_class=RequestsHttpConnection,
+        timeout=30
+    )
+
+
+def get_s3_client():
+    """Get S3 client for document storage"""
+    return boto3.client(
+        service_name='s3',
+        region_name=settings.s3_region,
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key
+    )
+
+
+# Lazy-loaded clients
+_bedrock_client = None
+_opensearch_client = None
+_s3_client = None
+
+
+def bedrock():
+    """Get or create Bedrock client"""
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = get_bedrock_client()
+    return _bedrock_client
+
+
+def opensearch():
+    """Get or create OpenSearch client"""
+    global _opensearch_client
+    if _opensearch_client is None:
+        _opensearch_client = get_opensearch_client()
+    return _opensearch_client
+
+
+def s3():
+    """Get or create S3 client"""
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = get_s3_client()
+    return _s3_client
+
